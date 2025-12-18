@@ -14,3 +14,5 @@ By no means perfect, but room in the distribution panel was limited, and with al
 Flashes led on parsing of the P1 datagram, which should be once per second.
 
 By also providing a TCP server interface for the datagrams, integration with HomeAsisstant should still work.
+
+Added a printable lipstick enclosure for the Waveshare esp32-s3-eth-poe board, as long as the pins are not soldered. See the enclosure directory for a Openscad drawing and STL files.
