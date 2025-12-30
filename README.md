@@ -8,6 +8,7 @@ Output available via
 - MQTT
 - Livedata via WebUI
 - Expects serial ingest via GPIO16 or GPIO18 depending on ESP32 or ESP32S3
+- Broadcasts SMA/Speedwire to multicast or unicast
 
 Possible to update firmware via WebUI on config page
 
