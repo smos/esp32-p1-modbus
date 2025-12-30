@@ -65,7 +65,7 @@ bool isP1Connecting = false;
 
 String configPincode = "1234"; 
 unsigned long lastP1TelegramTime = 0;
-const unsigned long P1_TIMEOUT_MS = 60000; 
+const unsigned long P1_TIMEOUT_MS = 30000; 
 
 Preferences prefs;
 AsyncWebServer server(80);
@@ -126,6 +126,25 @@ static inline uint16_t defaultSusyFor(uint8_t dt) {
 
 // internal pacing
 unsigned long lastSpeedwireTx = 0;
+
+// --- Deferred reboot state (handled from loop()) ---
+volatile bool g_pendingRestart = false;
+unsigned long g_restartAtMs = 0;
+
+// Schedule a restart after delayMs (served page can be flushed)
+void scheduleRestart(unsigned long delayMs = 1000) {
+  g_pendingRestart = true;
+  g_restartAtMs = millis() + delayMs;
+}
+
+// ---- P1 heartbeat & watchdog settings ----
+const unsigned long P1_HEARTBEAT_INTERVAL_MS = 1000;  // how often we check for misses
+const unsigned long P1_WATCHDOG_MS           = 60000; // reboot if no telegram for 60s
+
+// Tracking counters
+uint32_t      p1MissedHeartbeats   = 0;      // consecutive missed 1s heartbeats
+unsigned long lastHeartbeatCheckMs = 0;      // pacing for heartbeat checks
+uint32_t      p1WatchdogTriggers   = 0;      // times the watchdog fired (for diagnostics)
 
 // ======================================================
 // 2. DATA STRUCTURES & P1 VALUES
@@ -271,7 +290,7 @@ void connectToP1() {
         #else
             setLEDState(LOW); 
         #endif
-        lastP1TelegramTime = millis(); 
+        // lastP1TelegramTime = millis(); 
     }
   }
 }
@@ -355,6 +374,8 @@ void parseP1Line(const String& line) {
     #endif
 
   }
+
+  p1MissedHeartbeats = 0;
 }
 
 void writeHoldingWithScale(uint16_t addr, float value, float multiplier) {
@@ -548,54 +569,71 @@ void sendSpeedwireOnce() {
   speedwireUDP.endPacket();
 }
 
-// Unified "saved/OTA -> restarting" response with auto-redirect back to "/"
-void sendRestartAndAutoRedirect(AsyncWebServerRequest* request, const char* msg = "Restarting...") {
-  String html;
-  html += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Restarting...</title>";
-  html += "<style>body{font-family:sans-serif;margin:2rem;}button{padding:.5rem 1rem;}small{color:#666}</style>";
-  html += "<script>";
-  html += R"JS(
-    (function(){
-      const target = "/";
-      let delay = 500;
-
-      async function tryRefresh() {
-        try {
-          // Opaque fetch (no-cors) + image ping to detect availability
-          await fetch(target, { cache: "no-store", mode: "no-cors" });
-          const img = new Image();
-          img.onload = () => { window.location.replace(target); };
-          img.onerror = () => { scheduleNext(); };
-          img.src = target + "?ping=" + Date.now();
-        } catch (e) {
-          scheduleNext();
-        }
-      }
-      function scheduleNext(){ delay = Math.min(5000, Math.floor(delay * 1.5)); setTimeout(tryRefresh, delay); }
-      window.manualGoHome = () => { window.location.replace(target); };
-      setTimeout(tryRefresh, delay);
-    })();
-  )JS";
-  html += "</script></head><body>";
-  html += "<h2>" + String(msg) + "</h2>";
-  html += "<p>The device is rebooting. You will be returned to the homepage automatically.</p>";
-  html += "<button onclick='manualGoHome()'>Go to Home Now</button><br><br>";
-  html += "<small>If not redirected within ~30 seconds, click the button above.</small>";
-  html += "</body></html>";
-
-  AsyncWebServerResponse* resp = request->beginResponse(200, "text/html; charset=utf-8", html);
-  resp->addHeader("Connection", "close");
-  request->send(resp);
-
-  // Allow response to flush cleanly before reboot
-  delay(1000);
-  ESP.restart();
+// Build info (compiled into the binary)
+String getBuildInfo() {
+  // __DATE__ and __TIME__ are standard compile-time macros
+  return String(__DATE__) + " " + String(__TIME__);
 }
 
 
 // ======================================================
 // 4. WEB UI & CONFIGURATION
 // ======================================================
+
+void sendRestartAndAutoRedirect(AsyncWebServerRequest* request, const char* msg = "Restarting...") {
+  String html;
+  html += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Restarting...</title>";
+
+  // Meta refresh fallback after 8s (in case JS timers get throttled)
+  html += "<meta http-equiv='refresh' content='8;url=/'/>";
+
+  html += "<style>body{font-family:sans-serif;margin:2rem;}button{padding:.5rem 1rem;}small{color:#666}</style>";
+  html += "<script>";
+  html += R"JS(
+    (function(){
+      const target = "/";
+      const probe  = "/healthz";
+      let delay = 800;           // start at 0.8s
+      const MAX_DELAY = 5000;    // cap at 5s
+
+      async function tryProbe(){
+        try {
+          const res = await fetch(probe, { cache:"no-store" });
+          if (res && res.ok) {
+            // Device is back; go home
+            window.location.replace(target);
+            return;
+          }
+        } catch(e) {
+          // ignore; we'll backoff and retry
+        }
+        // Schedule next attempt
+        delay = Math.min(MAX_DELAY, Math.floor(delay * 1.5));
+        setTimeout(tryProbe, delay);
+      }
+
+      // Manual fallback
+      window.manualGoHome = () => { window.location.replace(target); };
+
+      // Start probing soon to let the ESP32 begin its reboot
+      setTimeout(tryProbe, delay);
+    })();
+  )JS";
+  html += "</script></head><body>";
+  html += "<h2>" + String(msg) + "</h2>";
+  html += "<p>The device is rebooting. You will be returned to the homepage automatically once it’s back online.</p>";
+  html += "<button onclick='manualGoHome()'>Go to Home Now</button><br><br>";
+  html += "<small>If not redirected within ~30 seconds, click the button above.</small>";
+  html += "</body></html>";
+
+  AsyncWebServerResponse* resp = request->beginResponse(200, "text/html; charset=utf-8", html);
+  resp->addHeader("Connection", "close");
+  resp->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  request->send(resp);
+
+  // IMPORTANT: do not reboot inside the handler; schedule it and let loop() do it later
+  scheduleRestart(1000);  // ~1s deferred reboot
+}
 
 void sendLiveData() {
     String html = "<table><tr><th>Metric</th><th>Value</th><th>Unit</th></tr>";
@@ -867,8 +905,34 @@ String generateSpeedwireTabContent() {
 
 void setupWebServer() {
     server.addHandler(&ws);
+
+    // Lightweight health check endpoint
+    server.on("/healthz", HTTP_GET, [](AsyncWebServerRequest* request){
+      AsyncWebServerResponse* resp = request->beginResponse(200, "text/plain; charset=utf-8", "OK");
+      resp->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+      request->send(resp);
+    });
+
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        String html = "<html><head><style>body{font-family:sans-serif;} table{border:1px solid #000; border-collapse:collapse; width:100%;} td,th{padding:8px; border:1px solid #ccc; text-align:left;} .tab{overflow:hidden; border:1px solid #ccc; background:#f1f1f1;} .tab button{float:left; border:none; padding:14px 16px; cursor:pointer;} .tabcontent{display:none; padding:12px; border:1px solid #ccc; border-top:none;}</style>";
+        String html;
+        html += R"HTML(
+        <html><head><style>
+          body{font-family:sans-serif; margin:0; padding-bottom:50px;}
+          table{border:1px solid #000; border-collapse:collapse; width:100%;}
+          td,th{padding:8px; border:1px solid #ccc; text-align:left;}
+          .tab{overflow:hidden; border:1px solid #ccc; background:#f1f1f1;}
+          .tab button{float:left; border:none; padding:14px 16px; cursor:pointer;}
+          .tabcontent{display:none; padding:12px; border:1px solid #ccc; border-top:none;}
+          footer.site-footer{
+            position:fixed; left:0; right:0; bottom:0;
+            background:#f9f9f9; border-top:1px solid #ddd;
+            padding:8px 12px; font-size:13px; color:#333;
+            display:flex; gap:12px; align-items:center; justify-content:flex-start;
+          }
+          footer.site-footer a{color:#0366d6; text-decoration:none;}
+          footer.site-footer a:hover{text-decoration:underline;}
+        </style>
+        )HTML";
         html += "<script>";
         html += "function updateMbPresetFields() {";
         html += "  var p = document.getElementById('presetSelect').value;";
@@ -955,8 +1019,32 @@ void setupWebServer() {
         html += "<div id='Modbus' class='tabcontent'>" + generateModbusTabContent() + "</div>";
         html += "<div id='Speedwire' class='tabcontent'>" + generateSpeedwireTabContent() + "</div>";
         html += "<div id='Config' class='tabcontent'>" + generateConfigTabContent() + "</div>";
-        html += "<div id='Logs' class='tabcontent'>" + generateLogTabContent() + "</div></body></html>";
+        html += "<div id='Logs' class='tabcontent'>" + generateLogTabContent() + "</div>";
+
+        // Footer with repo link and build date/time
+        html += "<footer class='site-footer'>";
+        html += "<span>Project: </span>";
+        html += "<a href='https://github.com/smos/esp32-p1-modbus'>esp32-p1-modbus</a>";
+        html += "<span> | Build: " + getBuildInfo() + "</span>";
+        html += "</footer>";
+
+        html += "</body></html>";
         request->send(200, "text/html", html);
+    });
+    
+    server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest* request){
+      sendRestartAndAutoRedirect(request, "Manual Restart requested...");
+    });
+
+    server.on("/config_mb", HTTP_GET, [](AsyncWebServerRequest* request){
+      // Render a small page that hosts the Modbus tab content directly
+      String html;
+      html += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Modbus Config</title>";
+      html += "<style>body{font-family:sans-serif;margin:2rem;}</style></head><body>";
+      html += "<h2>Modbus Configuration</h2>";
+      html += generateModbusTabContent();  // reuse your generator
+      html += "</body></html>";
+      request->send(200, "text/html; charset=utf-8", html);
     });
 
     server.on("/config_mb", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -995,6 +1083,17 @@ void setupWebServer() {
 
         prefs.end();
         sendRestartAndAutoRedirect(request, "Modbus settings saved. Restarting...");
+    });
+
+    server.on("/config_sw", HTTP_GET, [](AsyncWebServerRequest* request){
+      // Render a small page that hosts the Speedwire tab content directly
+      String html;
+      html += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Speedwire Config</title>";
+      html += "<style>body{font-family:sans-serif;margin:2rem;}</style></head><body>";
+      html += "<h2>Speedwire Configuration</h2>";
+      html += generateSpeedwireTabContent();  // reuse your generator
+      html += "</body></html>";
+      request->send(200, "text/html; charset=utf-8", html);
     });
     
     server.on("/config_sw", HTTP_POST, [] (AsyncWebServerRequest *request) {
@@ -1164,7 +1263,7 @@ void loop() {
     else if (ledP1FlashStartTime > 0 && millis() - ledP1FlashStartTime >= LED_FLASH_DURATION) { setLEDColor(CRGB::Black); ledP1FlashStartTime = 0; }
     else if (ledModbusFlashStartTime > 0 && millis() - ledModbusFlashStartTime >= LED_FLASH_DURATION) { setLEDColor(CRGB::Black); ledModbusFlashStartTime = 0; }
     else if (!(p1Client.connected() || p1UseSerial)) setLEDColor(CRGB::Red); else setLEDColor(CRGB::Black); 
-    #else
+  #else
     // --- Single onboard LED path ---
     // NOTE: LED_BUILTIN_PIN was set as OUTPUT in setup(), and LOW means OFF on most ESP32 dev boards.
     if (isP1Connecting) {
@@ -1195,8 +1294,7 @@ void loop() {
         // Normal operation: OFF
         setLEDState(LOW);
     }
-    #endif
-
+  #endif
 
   timeClient.update();
   static unsigned long lastP1Try = 0, lastUpdate = 0;
@@ -1227,7 +1325,8 @@ void loop() {
   
   if ((p1UseSerial || p1Client.connected()) && (millis() - lastP1TelegramTime > P1_TIMEOUT_MS)) {
       if (p1Client.connected()) p1Client.stop(); 
-      lastP1Try = 0; lastP1TelegramTime = millis();
+      lastP1Try = 0;
+      // lastP1TelegramTime = millis();
   }
 
   if (millis() - lastUpdate >= 1000) {
@@ -1253,6 +1352,42 @@ void loop() {
   if (mqttEnabled && !mqtt.connected()) mqtt.connect("ESP32-P1-Bridge", mqttUser.c_str(), mqttPass.c_str());
   mqtt.loop();
 
-  // after sendLiveData() etc., still inside the 1-second block:
+  
+  // ---- Heartbeat miss tracking (every 1s) ----
+  if (millis() - lastHeartbeatCheckMs >= P1_HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatCheckMs = millis();
+
+    unsigned long since = millis() - lastP1TelegramTime;
+
+    if (since >= P1_HEARTBEAT_INTERVAL_MS) {
+      // Missed at least one heartbeat (no telegram in the last second)
+      p1MissedHeartbeats++;
+      unsigned long remaining = (since < P1_WATCHDOG_MS) ? (P1_WATCHDOG_MS - since) : 0;
+
+      // Log sparingly: first 3 misses, and then every 5 misses
+      if (p1MissedHeartbeats <= 3 || (p1MissedHeartbeats % 5) == 0) {
+        logMessage("P1 heartbeat missed: %lus since last telegram (misses=%u, watchdog in %lus)",
+                  (unsigned)(since/1000),
+                  (unsigned)p1MissedHeartbeats,
+                  (unsigned)(remaining/1000));
+      }
+    } else {
+      // We received a telegram in the last second—reset counter
+      p1MissedHeartbeats = 0;
+    }
+  }
+
+  // ---- Watchdog: schedule a reboot if no P1 data for 60s ----
+  if ((millis() - lastP1TelegramTime) > P1_WATCHDOG_MS) {
+    if (!g_pendingRestart) { // prevent repeated scheduling
+      p1WatchdogTriggers++;
+      logMessage("P1 watchdog: no telegram for 60s… Scheduling restart…");
+    }
+  }
+  // ---- Deferred reboot trigger ----
+  if (g_pendingRestart && (long)(millis() - g_restartAtMs) >= 0) {
+    g_pendingRestart = false;
+    ESP.restart();
+  }
 
 }
