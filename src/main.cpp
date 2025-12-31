@@ -138,7 +138,7 @@ void scheduleRestart(unsigned long delayMs = 1000) {
 }
 
 // ---- P1 heartbeat & watchdog settings ----
-const unsigned long P1_HEARTBEAT_INTERVAL_MS = 1000;  // how often we check for misses
+const unsigned long P1_HEARTBEAT_INTERVAL_MS = 1500;  // how often we check for misses
 const unsigned long P1_WATCHDOG_MS           = 60000; // reboot if no telegram for 60s
 
 // Tracking counters
@@ -1326,7 +1326,6 @@ void loop() {
   if ((p1UseSerial || p1Client.connected()) && (millis() - lastP1TelegramTime > P1_TIMEOUT_MS)) {
       if (p1Client.connected()) p1Client.stop(); 
       lastP1Try = 0;
-      // lastP1TelegramTime = millis();
   }
 
   if (millis() - lastUpdate >= 1000) {
@@ -1382,6 +1381,7 @@ void loop() {
     if (!g_pendingRestart) { // prevent repeated scheduling
       p1WatchdogTriggers++;
       logMessage("P1 watchdog: no telegram for 60s… Scheduling restart…");
+      g_pendingRestart = true;
     }
   }
   // ---- Deferred reboot trigger ----
