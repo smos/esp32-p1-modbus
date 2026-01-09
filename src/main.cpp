@@ -12,6 +12,10 @@
 #include <NTPClient.h>
 #include <WiFiUdp.h>        
 
+#include <esp_freertos_hooks.h>   // idle hooks for CPU load  (ESP-IDF)
+#include <esp_timer.h>            // µs timers
+#include <esp_heap_caps.h>        // extra heap info helpers (optional)
+
 #if defined(ARDUINO_ESP32S3_DEV) || defined(BOARD_HAS_RGB_LED)
     #include <FastLED.h>
 #endif
@@ -94,6 +98,13 @@ String mqttUser = "";
 String mqttPass = "";
 bool mqttEnabled = false; 
 
+// ---- SmartEVSE settings & pacing ----
+bool seEnabled = false;
+String seAddr = "";               // IP or hostname of SmartEVSE
+String seLastStatus = "—";        // last HTTP status line or error
+unsigned long lastSmartEvseTx = 0;
+const unsigned long SMART_EVSE_TX_INTERVAL_MS = 1000; // once per second
+
 String telegramBuffer;
 String rawTelegramCapture; 
 
@@ -145,6 +156,37 @@ const unsigned long P1_WATCHDOG_MS           = 60000; // reboot if no telegram f
 uint32_t      p1MissedHeartbeats   = 0;      // consecutive missed 1s heartbeats
 unsigned long lastHeartbeatCheckMs = 0;      // pacing for heartbeat checks
 uint32_t      p1WatchdogTriggers   = 0;      // times the watchdog fired (for diagnostics)
+
+
+// ===== Runtime Stats =====
+// -- CPU load via idle hooks (per core) --
+volatile uint32_t g_idleCntCore0 = 0;
+volatile uint32_t g_idleCntCore1 = 0;
+uint32_t g_idleBaseCore0 = 0, g_idleBaseCore1 = 0; // baseline after calibration
+uint32_t g_prevIdle0 = 0, g_prevIdle1 = 0;
+bool     g_idleCalibrated = false;
+unsigned long g_idleCalStartMs = 0;
+float    g_cpuLoadPct = 0.0f;     // last 1s window
+float    g_cpuLoadEMA = 0.0f;     // smoothed (alpha=0.2)
+
+// -- Interval ring buffers for medians (ms) --
+struct IntervalStats {
+  uint16_t cap = 32;
+  uint16_t count = 0;
+  uint16_t idx = 0;
+  uint32_t buf[32];
+};
+IntervalStats stP1, stSW, stMQTT, stSE;
+
+unsigned long lastP1DoneMs  = 0;
+unsigned long lastSWMs      = 0;
+unsigned long lastMQTTMs    = 0;
+unsigned long lastSEMs      = 0;
+
+
+extern "C" bool idleHookCore0() { g_idleCntCore0++; return true; }
+extern "C" bool idleHookCore1() { g_idleCntCore1++; return true; }
+
 
 // ======================================================
 // 2. DATA STRUCTURES & P1 VALUES
@@ -218,6 +260,25 @@ static inline void be64(std::vector<uint8_t>& b, uint64_t v){
 static inline void obis(std::vector<uint8_t>& b, uint8_t B, uint8_t C, uint8_t D, uint8_t E){
   b.push_back(B); b.push_back(C); b.push_back(D); b.push_back(E);
 }
+
+static inline void addSample(IntervalStats& s, uint32_t v) {
+  s.buf[s.idx % s.cap] = v;
+  s.idx++;
+  if (s.count < s.cap) s.count++;
+}
+static uint32_t medianOf(const IntervalStats& s) {
+  if (s.count == 0) return 0;
+  // copy & insertion-sort (N<=32)
+  uint32_t tmp[32];
+  for (uint16_t i=0;i<s.count;i++) tmp[i] = s.buf[i];
+  for (uint16_t i=1;i<s.count;i++) {
+    uint32_t key = tmp[i]; int j = i - 1;
+    while (j>=0 && tmp[j] > key) { tmp[j+1] = tmp[j]; j--; }
+    tmp[j+1] = key;
+  }
+  return tmp[s.count/2];
+}
+
 
 // ======================================================
 // 3. CORE LOGIC FUNCTIONS
@@ -315,6 +376,10 @@ void parseP1Line(const String& line) {
     lastP1TelegramTime = millis();
     int pos = 0;
     float L1_Import_W = 0.0f, L1_Export_W = 0.0f, L2_Import_W = 0.0f, L2_Export_W = 0.0f, L3_Import_W = 0.0f, L3_Export_W = 0.0f;
+    // In parseP1Line(), inside the block where a full telegram '!' was just handled:
+    unsigned long nowMs = millis();
+    if (lastP1DoneMs != 0) addSample(stP1, (uint32_t)(nowMs - lastP1DoneMs));
+    lastP1DoneMs = nowMs;
 
     while (true) {
       int end = telegramBuffer.indexOf('\n', pos);
@@ -338,8 +403,9 @@ void parseP1Line(const String& line) {
       else if (obisLine.startsWith("1-0:2.8.1")) energyExportT1 = extractObisValue(obisLine);
       else if (obisLine.startsWith("1-0:2.8.2")) energyExportT2 = extractObisValue(obisLine);
       else if (obisLine.startsWith("1-0:14.7.0")) frequencyHz = extractObisValue(obisLine);
+
     }
-    
+
     phases[0].power = L1_Import_W - L1_Export_W;
     phases[1].power = L2_Import_W - L2_Export_W;
     phases[2].power = L3_Import_W - L3_Export_W;
@@ -567,7 +633,124 @@ void sendSpeedwireOnce() {
   speedwireUDP.beginPacket(maddr, swPort);
   speedwireUDP.write(pkt.data(), pkt.size());
   speedwireUDP.endPacket();
+
+  unsigned long nowMs = millis();
+  if (lastSWMs != 0) addSample(stSW, (uint32_t)(nowMs - lastSWMs));
+  lastSWMs = nowMs;
 }
+
+// ---- SmartEVSE helpers (no lambdas) ----
+// Remaining budget until a fixed deadline (can be negative if exceeded)
+inline long timeLeftUntil(unsigned long deadlineMs) {
+  return (long)(deadlineMs - millis());
+}
+
+// Convert phase current in Amps -> deci-Amps (A*10), with sanity defaults/clamps.
+// If value is missing/invalid or very small, return 0 (as required for L2/L3 fallback).
+inline int toDeciAmp(float amps) {
+  if (!isfinite(amps) || fabsf(amps) < 0.001f) return 0;
+  long v = lroundf(amps * 10.0f);
+  if (v < 0) v = 0;        // do not send negative
+  if (v > 2000) v = 2000;  // safety clamp; adjust upper bound if desired
+  return (int)v;
+}
+
+void sendSmartEvseOnce() {
+  if (!seEnabled) return;
+  if (seAddr.length() == 0) return;
+
+  // Absolute deadline at 600 ms to avoid overlaps on poor WiFi
+  const unsigned long MAX_BUDGET_MS = 600;
+  const unsigned long startMs = millis();
+  const unsigned long deadlineMs = startMs + MAX_BUDGET_MS;
+
+  // Build deci-amp values: A * 10, rounded; default 0 for L2/L3 if missing/very small
+  const int L1 = toDeciAmp(phases[0].current);
+  const int L2 = toDeciAmp(phases[1].current);
+  const int L3 = toDeciAmp(phases[2].current);
+
+  String path = "/currents?L1=" + String(L1) + "&L2=" + String(L2) + "&L3=" + String(L3);
+
+  WiFiClient client;
+
+  // CONNECT phase — bail if deadline will be exceeded
+  {
+    long left = timeLeftUntil(deadlineMs);
+    if (left <= 0) { seLastStatus = "timeout_connect"; return; }
+
+    bool ok = false;
+    // If your core provides a 3-arg connect w/ timeout, use it; otherwise guard with our wall-clock budget.
+    #ifdef ARDUINO_WIFI_HAS_CONNECT_TIMEOUT
+      ok = client.connect(seAddr.c_str(), 80, (uint32_t)left);
+    #else
+      ok = client.connect(seAddr.c_str(), 80);
+    #endif
+    if (!ok) {
+      seLastStatus = "connect_failed";
+      logMessage("SmartEVSE: connect to %s failed", seAddr.c_str());
+      client.stop();
+      return;
+    }
+  }
+
+  // WRITE phase — ensure we don’t block beyond 600 ms
+  {
+    if (timeLeftUntil(deadlineMs) <= 0) { seLastStatus = "timeout_write"; client.stop(); return; }
+
+    String req;
+    req.reserve(128);
+    req += "POST " + path + " HTTP/1.1\r\n";
+    req += "Host: " + seAddr + "\r\n";
+    req += "Connection: close\r\n";
+    req += "Content-Length: 0\r\n\r\n";
+
+    size_t total = req.length();
+    size_t sent = 0;
+    const char* p = req.c_str();
+    while (sent < total) {
+      if (timeLeftUntil(deadlineMs) <= 0) { seLastStatus = "timeout_write"; client.stop(); return; }
+      size_t n = client.write((const uint8_t*)(p + sent), total - sent);
+      if (n == 0) { delay(2); continue; }
+      sent += n;
+    }
+  }
+
+  // READ phase — read status line only, within remaining budget
+  String statusLine;
+  {
+    while (client.connected() && timeLeftUntil(deadlineMs) > 0) {
+      while (client.available()) {
+        char c = client.read();
+        if (c == '\r') continue;
+        if (c == '\n') goto got_status;
+        statusLine += c;
+        if (statusLine.length() > 120) goto got_status; // avoid long headers
+      }
+      delay(2); // brief wait without blowing the budget
+    }
+  }
+got_status:
+  if (statusLine.length() == 0) {
+    if (timeLeftUntil(deadlineMs) <= 0) seLastStatus = "timeout_status";
+    else seLastStatus = "no_status";
+  } else {
+    seLastStatus = statusLine;
+  }
+
+  // Optional: log only non-2xx to keep logs clean
+  if (statusLine.indexOf("200") < 0 && statusLine.indexOf("204") < 0) {
+    logMessage("SmartEVSE: POST %s -> %s (dur=%lums)",
+               path.c_str(), seLastStatus.c_str(), (unsigned long)(millis() - startMs));
+  }
+
+  // Just before client.stop(); at the end of sendSmartEvseOnce():
+  unsigned long nowMs = millis();
+  if (lastSEMs != 0) addSample(stSE, (uint32_t)(nowMs - lastSEMs));
+  lastSEMs = nowMs;
+
+  client.stop();
+}
+
 
 // Build info (compiled into the binary)
 String getBuildInfo() {
@@ -593,7 +776,7 @@ void sendRestartAndAutoRedirect(AsyncWebServerRequest* request, const char* msg 
     (function(){
       const target = "/";
       const probe  = "/healthz";
-      let delay = 800;           // start at 0.8s
+      let delay = 8000;           // start at 0.8s
       const MAX_DELAY = 5000;    // cap at 5s
 
       async function tryProbe(){
@@ -635,6 +818,51 @@ void sendRestartAndAutoRedirect(AsyncWebServerRequest* request, const char* msg 
   scheduleRestart(1000);  // ~1s deferred reboot
 }
 
+// ---- Authorization helper: check 'pincode' param or prompt ----
+bool requirePincodeOrPrompt(AsyncWebServerRequest* request, const char* title = "Authorization Required") {
+  // Accept both GET and POST; look for 'pincode' param
+  String provided = "";
+  if (request->hasParam("pincode", true)) {
+    provided = request->getParam("pincode", true)->value();
+  } else if (request->hasParam("pincode")) {
+    provided = request->getParam("pincode")->value();
+  }
+
+  if (provided == configPincode) {
+    return true; // authorized
+  }
+
+  // Show a small auth form that POSTs/GETs back to the same URL
+  String path = request->url();  // original path
+  String method = (request->method() == HTTP_GET) ? "GET" : "POST";
+
+  String html;
+  html += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>";
+  html += String(title);
+  html += "</title><style>body{font-family:sans-serif;margin:2rem;}input{padding:.4rem;}button{padding:.5rem 1rem;margin-top:.5rem;}</style></head><body>";
+  html += "<h2>" + String(title) + "</h2>";
+  html += "<p>Please enter the current pincode to continue.</p>";
+  html += "<form action='" + path + "' method='" + method + "'>";
+  html += "<label>Pincode:</label> <input type='password' name='pincode' style='width:120px;' autofocus>";
+  // Preserve any POST fields that were sent (for POST retry with pincode)
+  if (request->method() == HTTP_POST) {
+    int n = request->params();
+    for (int i = 0; i < n; ++i) {
+      auto p = request->getParam(i);
+      if (!p->isFile() && p->name() != "pincode") {
+        html += "<input type='hidden' name='" + p->name() + "' value='" + p->value() + "'>";
+      }
+    }
+  }
+  html += "<br><br><button type='submit'>Continue</button>";
+  html += "</form></body></html>";
+
+  AsyncWebServerResponse* resp = request->beginResponse(401, "text/html; charset=utf-8", html);
+  resp->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  request->send(resp);
+  return false;
+}
+
 void sendLiveData() {
     String html = "<table><tr><th>Metric</th><th>Value</th><th>Unit</th></tr>";
     for (size_t i = 0; i < P1_VALUE_COUNT; i++) {
@@ -650,6 +878,14 @@ void sendLiveData() {
     ws.textAll("UPTIME:" + getUptime()); 
 }
 
+String generateRuntimeTabContent() {
+  String html;
+  html += "<h3>Runtime Statistics</h3>";
+  html += "<div id='stats'>Collecting…</div>";
+  html += "<p><small>CPU load is estimated via FreeRTOS idle hooks on both cores (non-blocking), baseline calibrated ~2s after boot.</small></p>";
+  return html;
+}
+
 String generateStatusTabContent() {
   String html = "<h3>System Status</h3><table>";
   html += "<tr><td>Modbus TCP IP</td><td><strong>" + WiFi.localIP().toString() + ":502</strong></td></tr>";
@@ -663,6 +899,8 @@ String generateStatusTabContent() {
                     (swDeviceType==SW_DEV_EMETER20) ? "EMeter-20" :
                     (swDeviceType==SW_DEV_SHM20)    ? "Sunny Home Manager 2.0" : "Custom";
   html += "<tr><td>Speedwire</td><td><strong>" + String(swEnabled ? (swAddr + ":" + String(swPort) + " " + devLabel) : "DISABLED") + "</strong></td></tr>";
+  String evseStat = seEnabled ? (seAddr.length() ? (seAddr + " (/currents)") : "ENABLED, no address") : "DISABLED";
+  html += "<tr><td>SmartEVSE</td><td><strong>" + evseStat + "</strong></td></tr>";
   html += "<tr><td>NTP Time</td><td><strong>" + getTimestamp() + "</strong></td></tr></table>";
   html += "<hr><h3>P1 Live Data</h3><div id='data'>Loading...</div>";
 return html;
@@ -693,6 +931,10 @@ String generateConfigTabContent() {
 
 String generateModbusTabContent() {
   String html = "<h3>Modbus Configuration</h3><form action='/config_mb' method='POST'>";
+
+  // Pincode row (security)
+  html += "<table><tr><td>Pincode:</td><td>";
+  html += "<input type='password' name='pincode' placeholder='Required to save' style='width: 150px;'></td></tr></table>";
 
   // Meter-level settings
   html += "<table>";
@@ -857,6 +1099,9 @@ String generateSpeedwireTabContent() {
   String html;
   html += "<h3>Speedwire (SMA)</h3><form action='/config_sw' method='POST'>";
 
+  // Pincode field
+  html += "<tr><td>Pincode:</td><td><input type='password' name='pincode' placeholder='Required to save' style='width:150px;'></td></tr>";
+
   // A tiny script to auto-fill SUSyID when the device type changes
   html += "<script>"
           "function swOnTypeChanged(){"
@@ -900,6 +1145,34 @@ String generateSpeedwireTabContent() {
   // Initialize the SUSyID field if needed on first load
   html += "<script>swOnTypeChanged();</script>";
 
+  return html;
+}
+
+
+String generateSmartEvseTabContent() {
+  String html;
+  html += "<h3>SmartEVSE</h3><form action='/config_se' method='POST'>";
+  html += "<table>";
+
+  // Pincode for save authorization
+  html += "<tr><td>Pincode:</td><td><input type='password' name='pincode' ";
+  html += "placeholder='Required to save' style='width:150px;'></td></tr>";
+
+  // Enable
+  html += "<tr><td>Enable:</td><td><input type='checkbox' name='seEnabled' ";
+  html += String(seEnabled ? "checked" : "") + "></td></tr>";
+
+  // Target IP/host
+  html += "<tr><td>SmartEVSE Address:</td><td>";
+  html += "<input type='text' name='seAddr' value='" + seAddr + "' ";
+  html += "placeholder='e.g. 192.168.1.50' style='width:220px;'></td></tr>";
+
+  html += "</table><br>";
+  html += "<input type='submit' value='Save & Restart'>";
+  html += "</form>";
+
+  // Small status hint
+  html += "<p><small>Last send status: <b>" + seLastStatus + "</b></small></p>";
   return html;
 }
 
@@ -991,6 +1264,9 @@ void setupWebServer() {
                     var d=document.getElementById('data'); if(d) d.innerHTML = e.data.substring(5);
                 } else if (e.data.startsWith('UPTIME:')) {
                     var u=document.getElementById('uptime_val'); if(u) u.innerText = e.data.substring(7);
+                } else if (e.data.startsWith('STATS:')) {
+                  var s = document.getElementById('stats');
+                  if (s) s.innerHTML = e.data.substring(6);
                 }
                 };
 
@@ -1014,11 +1290,19 @@ void setupWebServer() {
         )JS";
 
         html += "</script></head><body onload=\"updateMbPresetFields(); document.getElementById('defaultOpen').click();\">";
-        html += "<h1>ESP32 P1 Bridge</h1><div class='tab'><button class='tablinks' onclick=\"openTab(event, 'Status')\" id='defaultOpen'>Status</button><button class='tablinks' onclick=\"openTab(event, 'Modbus')\">Modbus Config</button><button class='tablinks' onclick=\"openTab(event, 'Speedwire')\">Speedwire</button><button class='tablinks' onclick=\"openTab(event, 'Config')\">General Config</button><button class='tablinks' onclick=\"openTab(event, 'Logs')\">Logs</button></div>";
+        html += "<h1>ESP32 P1 Bridge</h1><div class='tab'><button class='tablinks' onclick=\"openTab(event, 'Status')\" id='defaultOpen'>Status</button>";
+        html += "<button class='tablinks' onclick=\"openTab(event, 'Modbus')\">Modbus Config</button>";
+        html += "<button class='tablinks' onclick=\"openTab(event, 'Speedwire')\">Speedwire</button>";
+        html += "<button class='tablinks' onclick=\"openTab(event, 'Config')\">General Config</button>";
+        html += "<button class='tablinks' onclick=\"openTab(event, 'SmartEVSE')\">SmartEVSE</button>";
+        html += "<button class='tablinks' onclick=\"openTab(event, 'Runtime')\">Runtime</button>";
+        html += "<button class='tablinks' onclick=\"openTab(event, 'Logs')\">Logs</button></div>";
         html += "<div id='Status' class='tabcontent'>" + generateStatusTabContent() + "</div>";
         html += "<div id='Modbus' class='tabcontent'>" + generateModbusTabContent() + "</div>";
         html += "<div id='Speedwire' class='tabcontent'>" + generateSpeedwireTabContent() + "</div>";
         html += "<div id='Config' class='tabcontent'>" + generateConfigTabContent() + "</div>";
+        html += "<div id='SmartEVSE' class='tabcontent'>" + generateSmartEvseTabContent() + "</div>";
+        html += "<div id='Runtime' class='tabcontent'>" + generateRuntimeTabContent() + "</div>";
         html += "<div id='Logs' class='tabcontent'>" + generateLogTabContent() + "</div>";
 
         // Footer with repo link and build date/time
@@ -1032,7 +1316,10 @@ void setupWebServer() {
         request->send(200, "text/html", html);
     });
     
+
     server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest* request){
+      if (!requirePincodeOrPrompt(request, "Reboot Authorization")) return;
+      // Authorized → proceed
       sendRestartAndAutoRedirect(request, "Manual Restart requested...");
     });
 
@@ -1047,42 +1334,42 @@ void setupWebServer() {
       request->send(200, "text/html; charset=utf-8", html);
     });
 
+
     server.on("/config_mb", HTTP_POST, [](AsyncWebServerRequest *request) {
-        prefs.begin("config", false);
+      if (!requirePincodeOrPrompt(request, "Modbus Save Authorization")) return;
 
-        // Meter-level settings set by UI/preset JS
-        if (request->hasParam("mbFormat", true))
-            prefs.putUChar("mbFormat", request->getParam("mbFormat", true)->value().toInt());
-        if (request->hasParam("mbDataType", true))
-            prefs.putUChar("mbDataType", request->getParam("mbDataType", true)->value().toInt());
+      prefs.begin("config", false);
+      // Meter-level settings set by UI/preset JS
+      if (request->hasParam("mbFormat", true))
+        prefs.putUChar("mbFormat", request->getParam("mbFormat", true)->value().toInt());
+      if (request->hasParam("mbDataType", true))
+        prefs.putUChar("mbDataType", request->getParam("mbDataType", true)->value().toInt());
 
-        // Slave ID
-        prefs.putUChar("modbusId", request->getParam("modbusId", true)->value().toInt());
+      // Slave ID
+      prefs.putUChar("modbusId", request->getParam("modbusId", true)->value().toInt());
 
-        // Per-register fields
-        for (int i = 0; i < P1_VALUE_COUNT; i++) {
-          // type
-          String rtypeName = "rtype_" + String(i);
-          if (request->hasParam(rtypeName, true)) {
-            uint8_t tval = (request->getParam(rtypeName, true)->value() == "input") ? REG_INPUT : REG_HOLDING;
-            prefs.putUChar(("t_" + String(i)).c_str(), tval);
-          }
-
-          // address
-          String regName = "reg_" + String(i);
-          if (request->hasParam(regName, true)) {
-            prefs.putUInt(("r_" + String(i)).c_str(), request->getParam(regName, true)->value().toInt());
-          }
-
-          // multiplier (NEW)
-          String mulName = "mul_" + String(i);   // change the field name in UI (see below)
-          if (request->hasParam(mulName, true)) {
-            prefs.putFloat(("m_" + String(i)).c_str(), request->getParam(mulName, true)->value().toFloat());
-          }
+      // Per-register fields
+      for (int i = 0; i < P1_VALUE_COUNT; i++) {
+        // type
+        String rtypeName = "rtype_" + String(i);
+        if (request->hasParam(rtypeName, true)) {
+          uint8_t tval = (request->getParam(rtypeName, true)->value() == "input") ? REG_INPUT : REG_HOLDING;
+          prefs.putUChar(("t_" + String(i)).c_str(), tval);
         }
+        // address
+        String regName = "reg_" + String(i);
+        if (request->hasParam(regName, true)) {
+          prefs.putUInt(("r_" + String(i)).c_str(), request->getParam(regName, true)->value().toInt());
+        }
+        // multiplier
+        String mulName = "mul_" + String(i);
+        if (request->hasParam(mulName, true)) {
+          prefs.putFloat(("m_" + String(i)).c_str(), request->getParam(mulName, true)->value().toFloat());
+        }
+      }
+      prefs.end();
 
-        prefs.end();
-        sendRestartAndAutoRedirect(request, "Modbus settings saved. Restarting...");
+      sendRestartAndAutoRedirect(request, "Modbus settings saved. Restarting...");
     });
 
     server.on("/config_sw", HTTP_GET, [](AsyncWebServerRequest* request){
@@ -1096,46 +1383,71 @@ void setupWebServer() {
       request->send(200, "text/html; charset=utf-8", html);
     });
     
-    server.on("/config_sw", HTTP_POST, [] (AsyncWebServerRequest *request) {
-        prefs.begin("config", false);
 
-        // Enable/address/port (already present)
-        bool en = request->hasParam("swEnabled", true);
-        prefs.putBool("swEnabled", en);
-        if (request->hasParam("swAddr", true)) prefs.putString("swAddr", request->getParam("swAddr", true)->value());
-        if (request->hasParam("swPort", true)) prefs.putUInt("swPort", request->getParam("swPort", true)->value().toInt());
+    server.on("/config_sw", HTTP_POST, [](AsyncWebServerRequest *request) {
+      if (!requirePincodeOrPrompt(request, "Speedwire Save Authorization")) return;
 
-        // Device type
-        if (request->hasParam("swDevType", true)) {
-            uint8_t dt = (uint8_t) request->getParam("swDevType", true)->value().toInt();
-            prefs.putUChar("swDevType", dt);
+      prefs.begin("config", false);
+      // Enable/address/port
+      bool en = request->hasParam("swEnabled", true);
+      prefs.putBool("swEnabled", en);
+      if (request->hasParam("swAddr", true)) prefs.putString("swAddr", request->getParam("swAddr", true)->value());
+      if (request->hasParam("swPort", true)) prefs.putUInt("swPort", request->getParam("swPort", true)->value().toInt());
 
-            // If SUSyID field is empty, preset to default for selected device
-            // We check presence/length to decide if user wants a custom override.
-            bool userProvidedSusy = request->hasParam("swSusyId", true) && request->getParam("swSusyId", true)->value().length() > 0;
-            if (!userProvidedSusy) {
-            prefs.putUShort("swSusyId", defaultSusyFor(dt));
-            }
+      // Device type
+      if (request->hasParam("swDevType", true)) {
+        uint8_t dt = (uint8_t) request->getParam("swDevType", true)->value().toInt();
+        prefs.putUChar("swDevType", dt);
+
+        bool userProvidedSusy = request->hasParam("swSusyId", true) && request->getParam("swSusyId", true)->value().length() > 0;
+        if (!userProvidedSusy) {
+          prefs.putUShort("swSusyId", defaultSusyFor(dt));
         }
+      }
 
-        // SUSyID (hex) — user override (optional)
-        if (request->hasParam("swSusyId", true) && request->getParam("swSusyId", true)->value().length() > 0) {
-            String s = request->getParam("swSusyId", true)->value();
-            uint16_t v = (uint16_t) strtol(s.c_str(), nullptr, 16);
-            prefs.putUShort("swSusyId", v);
-        }
+      // SUSyID (hex) — user override
+      if (request->hasParam("swSusyId", true) && request->getParam("swSusyId", true)->value().length() > 0) {
+        String s = request->getParam("swSusyId", true)->value();
+        uint16_t v = (uint16_t) strtol(s.c_str(), nullptr, 16);
+        prefs.putUShort("swSusyId", v);
+      }
 
-        // Serial (uint32) — 0 keeps "derive from chip"
-        if (request->hasParam("swSerial", true)) {
-            String s = request->getParam("swSerial", true)->value();
-            uint32_t v = (uint32_t) strtoul(s.c_str(), nullptr, 10);
-            prefs.putUInt("swSerial", v);
-        }
+      // Serial (uint32) — 0 keeps "derive from chip"
+      if (request->hasParam("swSerial", true)) {
+        String s = request->getParam("swSerial", true)->value();
+        uint32_t v = (uint32_t) strtoul(s.c_str(), nullptr, 10);
+        prefs.putUInt("swSerial", v);
+      }
+      prefs.end();
 
-        prefs.end();
-        sendRestartAndAutoRedirect(request, "Speedwire settings saved. Restarting...");
+      sendRestartAndAutoRedirect(request, "Speedwire settings saved. Restarting...");
     });
 
+    server.on("/config_se", HTTP_GET, [](AsyncWebServerRequest* request){
+      String html;
+      html += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>SmartEVSE Config</title>";
+      html += "<style>body{font-family:sans-serif;margin:2rem;}</style></head><body>";
+      html += "<h2>SmartEVSE Configuration</h2>";
+      html += generateSmartEvseTabContent();
+      html += "</body></html>";
+      request->send(200, "text/html; charset=utf-8", html);
+    });
+
+
+    server.on("/config_se", HTTP_POST, [](AsyncWebServerRequest* request){
+      if (!requirePincodeOrPrompt(request, "SmartEVSE Save Authorization")) return;  // <-- pincode gate
+
+      prefs.begin("config", false);
+      bool en = request->hasParam("seEnabled", true);
+      prefs.putBool("seEnabled", en);
+
+      if (request->hasParam("seAddr", true)) {
+        prefs.putString("seAddr", request->getParam("seAddr", true)->value());
+      }
+      prefs.end();
+
+      sendRestartAndAutoRedirect(request, "SmartEVSE settings saved. Restarting...");
+    });
     server.on("/config", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!request->hasParam("pincode", true) || request->getParam("pincode", true)->value() != configPincode) { 
             request->send(403, "text/plain", "Forbidden: Invalid Pincode"); return; 
@@ -1188,6 +1500,10 @@ void setup() {
   mqttHost = prefs.getString("mqttHost", "");
   mqttUser = prefs.getString("mqttUser", "");
   mqttPass = prefs.getString("mqttPass", "");
+
+  seEnabled = prefs.getBool("seEnabled", false);
+  seAddr    = prefs.getString("seAddr", "");
+  seLastStatus = "—";
 
   // Load per-register mapping (default: Holding, current addr/default, multiplier=1.0)
   for (int i = 0; i < P1_VALUE_COUNT; i++) {
@@ -1254,7 +1570,12 @@ void setup() {
   MBserver.start(502, modbusAddress, 20000);
   mqtt.setServer(mqttHost.c_str(), 1883);
   lastP1TelegramTime = millis();
-  
+
+  // CPU load: register per-core idle hooks (must not block)
+  esp_register_freertos_idle_hook_for_cpu(idleHookCore0, 0);
+  esp_register_freertos_idle_hook_for_cpu(idleHookCore1, 1);  // dual-core
+  g_idleCalStartMs = millis(); // start calibration window (~2s)
+
 }
 
 void loop() {
@@ -1335,18 +1656,93 @@ void loop() {
     holdingRegs.clear();
     inputRegs.clear();
 
-
-  for (int i = 0; i < P1_VALUE_COUNT; i++) {
-    float val = *allP1Values[i].ptr;
-    if (mbRegType[i] == REG_HOLDING) {
-      writeHoldingWithScale(mbRegAddr[i], val, mbRegMul[i]);
-    } else {
-      writeInputWithScale(mbRegAddr[i], val, mbRegMul[i]);
+    for (int i = 0; i < P1_VALUE_COUNT; i++) {
+      float val = *allP1Values[i].ptr;
+      if (mbRegType[i] == REG_HOLDING) {
+        writeHoldingWithScale(mbRegAddr[i], val, mbRegMul[i]);
+      } else {
+        writeInputWithScale(mbRegAddr[i], val, mbRegMul[i]);
+      }
     }
-  }
     sendLiveData(); 
     sendSpeedwireOnce();
-    if (mqttEnabled && mqtt.connected()) mqtt.publish((String(MQTT_BASE_TOPIC) + "/Power").c_str(), String(netTotalPowerW).c_str());
+    // SmartEVSE: send once per second if enabled
+    if (seEnabled && (millis() - lastSmartEvseTx >= SMART_EVSE_TX_INTERVAL_MS)) {
+      lastSmartEvseTx = millis();
+      sendSmartEvseOnce();
+    }
+
+    // ----- CPU load: 1s window -----
+    {
+      // idle deltas for the last second
+      uint32_t d0 = g_idleCntCore0 - g_prevIdle0;
+      uint32_t d1 = g_idleCntCore1 - g_prevIdle1;
+      g_prevIdle0 = g_idleCntCore0;
+      g_prevIdle1 = g_idleCntCore1;
+
+      // Calibrate baseline ~2s after boot (best-effort)
+      if (!g_idleCalibrated && (millis() - g_idleCalStartMs) >= 2000) {
+        // First stable reading becomes the baseline "idle-only" count per second
+        g_idleBaseCore0 = d0 ? d0 : 1;
+        g_idleBaseCore1 = d1 ? d1 : 1;
+        g_idleCalibrated = true;
+      }
+
+      if (g_idleCalibrated) {
+        float idleFrac0 = (float)d0 / (float)g_idleBaseCore0;
+        float idleFrac1 = (float)d1 / (float)g_idleBaseCore1;
+        // Average across cores, clamp to [0..1]
+        float idleFrac = fminf(1.0f, fmaxf(0.0f, (idleFrac0 + idleFrac1) * 0.5f));
+        g_cpuLoadPct = 100.0f * (1.0f - idleFrac);
+        // EMA smoothing
+        const float ALPHA = 0.20f;
+        g_cpuLoadEMA = (g_cpuLoadEMA == 0.0f) ? g_cpuLoadPct : (g_cpuLoadEMA*(1.0f-ALPHA) + g_cpuLoadPct*ALPHA);
+      }
+    }
+
+    // ----- Build and push stats snippet over WS -----
+    auto fmtSize = [](size_t v)->String {
+      if (v >= 1024*1024) return String((float)v/1048576.0, 2) + " MB";
+      if (v >= 1024)      return String((float)v/1024.0, 1) + " KB";
+      return String(v) + " B";
+    };
+
+    size_t heapTotal = ESP.getHeapSize();
+    size_t heapFree  = ESP.getFreeHeap();
+    size_t heapMin   = ESP.getMinFreeHeap();
+    size_t heapMaxBlk= ESP.getMaxAllocHeap();
+
+    uint32_t medP1   = medianOf(stP1);
+    uint32_t medSW   = medianOf(stSW);
+    uint32_t medMQTT = medianOf(stMQTT);
+    uint32_t medSE   = medianOf(stSE);
+
+    // Build lightweight HTML table
+    String s;
+    s.reserve(512);
+    s += "<table>";
+    s += "<tr><th colspan='2'>CPU & Memory</th></tr>";
+    s += "<tr><td>CPU Load (1s / EMA)</td><td><b>" + String((int)roundf(g_cpuLoadPct)) + "%</b> / " + String((int)roundf(g_cpuLoadEMA)) + "%</td></tr>";
+    s += "<tr><td>Heap Free / Total</td><td><b>" + fmtSize(heapFree) + "</b> / " + fmtSize(heapTotal) + "</td></tr>";
+    s += "<tr><td>Heap Min Free</td><td>" + fmtSize(heapMin) + "</td></tr>";
+    s += "<tr><td>Max Alloc Block</td><td>" + fmtSize(heapMaxBlk) + "</td></tr>";
+    s += "<tr><th colspan='2'>Median Update Interval (ms)</th></tr>";
+    s += "<tr><td>P1 telegram</td><td><b>" + String(medP1) + "</b></td></tr>";
+    s += "<tr><td>Speedwire</td><td><b>" + String(medSW) + "</b></td></tr>";
+    s += "<tr><td>MQTT</td><td><b>" + String(medMQTT) + "</b></td></tr>";
+    s += "<tr><td>SmartEVSE</td><td><b>" + String(medSE) + "</b></td></tr>";
+    s += "</table>";
+
+    if (ws.count() > 0) ws.textAll("STATS:" + s);
+
+
+    if (mqttEnabled && mqtt.connected()) {
+      if (mqtt.publish((String(MQTT_BASE_TOPIC) + "/Power").c_str(), String(netTotalPowerW).c_str())) {
+        unsigned long nowMs = millis();
+        if (lastMQTTMs != 0) addSample(stMQTT, (uint32_t)(nowMs - lastMQTTMs));
+        lastMQTTMs = nowMs;
+      }
+    }
   }
   if (mqttEnabled && !mqtt.connected()) mqtt.connect("ESP32-P1-Bridge", mqttUser.c_str(), mqttPass.c_str());
   mqtt.loop();
