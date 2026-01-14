@@ -410,11 +410,13 @@ void parseP1Line(const String& line) {
     phases[1].power = L2_Import_W - L2_Export_W;
     phases[2].power = L3_Import_W - L3_Export_W;
 
-    for (int i = 0; i < 3; i++) {
-        if (abs(phases[i].voltage) > 1.0f) phases[i].current = abs(phases[i].power / phases[i].voltage);
-        else phases[i].current = 0.0f;
+for (int i = 0; i < 3; i++) {
+    if (abs(phases[i].voltage) > 1.0f) {
+        phases[i].current = phases[i].power / phases[i].voltage;
+    } else {
+        phases[i].current = 0.0f;
     }
-
+}
     // Derive L-L voltages assuming 120° phase separation:
     // |Vab| = sqrt(Va^2 + Vb^2 + Va*Vb), similarly for BC, CA.  (cos 120° = -1/2)
     auto Vll = [](float Va, float Vb) -> float {
@@ -650,11 +652,11 @@ inline long timeLeftUntil(unsigned long deadlineMs) {
 inline int toDeciAmp(float amps) {
   if (!isfinite(amps) || fabsf(amps) < 0.001f) return 0;
   long v = lroundf(amps * 10.0f);
-  if (v < 0) v = 0;        // do not send negative
-  if (v > 2000) v = 2000;  // safety clamp; adjust upper bound if desired
+  // Remove the 'if (v < 0) v = 0;' line
+  if (v > 2000) v = 2000;  // Keep the upper safety clamp
+  if (v < -2000) v = -2000; // Optional: add a lower safety clamp
   return (int)v;
 }
-
 void sendSmartEvseOnce() {
   if (!seEnabled) return;
   if (seAddr.length() == 0) return;
@@ -1672,7 +1674,40 @@ void loop() {
       sendSmartEvseOnce();
     }
 
-    // ----- CPU load: 1s window -----
+    if (mqttEnabled && mqtt.connected()) {
+      if (mqtt.publish((String(MQTT_BASE_TOPIC) + "/Power").c_str(), String(netTotalPowerW).c_str())) {
+        unsigned long nowMs = millis();
+        if (lastMQTTMs != 0) addSample(stMQTT, (uint32_t)(nowMs - lastMQTTMs));
+        lastMQTTMs = nowMs;
+      }
+    }
+  }
+  if (mqttEnabled && !mqtt.connected()) mqtt.connect("ESP32-P1-Bridge", mqttUser.c_str(), mqttPass.c_str());
+  mqtt.loop();
+
+  // ---- Heartbeat miss tracking (every 1s) ----
+  if (millis() - lastHeartbeatCheckMs >= P1_HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatCheckMs = millis();
+
+    unsigned long since = millis() - lastP1TelegramTime;
+
+    if (since >= P1_HEARTBEAT_INTERVAL_MS) {
+      // Missed at least one heartbeat (no telegram in the last second)
+      p1MissedHeartbeats++;
+      unsigned long remaining = (since < P1_WATCHDOG_MS) ? (P1_WATCHDOG_MS - since) : 0;
+
+      // Log sparingly: first 3 misses, and then every 5 misses
+      if (p1MissedHeartbeats <= 3 || (p1MissedHeartbeats % 5) == 0) {
+        logMessage("P1 heartbeat missed: %lus since last telegram (misses=%u, watchdog in %lus)",
+                  (unsigned)(since/1000),
+                  (unsigned)p1MissedHeartbeats,
+                  (unsigned)(remaining/1000));
+      }
+    } else {
+      // We received a telegram in the last second—reset counter
+      p1MissedHeartbeats = 0;
+    }
+        // ----- CPU load: 1s window -----
     {
       // idle deltas for the last second
       uint32_t d0 = g_idleCntCore0 - g_prevIdle0;
@@ -1734,42 +1769,6 @@ void loop() {
     s += "</table>";
 
     if (ws.count() > 0) ws.textAll("STATS:" + s);
-
-
-    if (mqttEnabled && mqtt.connected()) {
-      if (mqtt.publish((String(MQTT_BASE_TOPIC) + "/Power").c_str(), String(netTotalPowerW).c_str())) {
-        unsigned long nowMs = millis();
-        if (lastMQTTMs != 0) addSample(stMQTT, (uint32_t)(nowMs - lastMQTTMs));
-        lastMQTTMs = nowMs;
-      }
-    }
-  }
-  if (mqttEnabled && !mqtt.connected()) mqtt.connect("ESP32-P1-Bridge", mqttUser.c_str(), mqttPass.c_str());
-  mqtt.loop();
-
-  
-  // ---- Heartbeat miss tracking (every 1s) ----
-  if (millis() - lastHeartbeatCheckMs >= P1_HEARTBEAT_INTERVAL_MS) {
-    lastHeartbeatCheckMs = millis();
-
-    unsigned long since = millis() - lastP1TelegramTime;
-
-    if (since >= P1_HEARTBEAT_INTERVAL_MS) {
-      // Missed at least one heartbeat (no telegram in the last second)
-      p1MissedHeartbeats++;
-      unsigned long remaining = (since < P1_WATCHDOG_MS) ? (P1_WATCHDOG_MS - since) : 0;
-
-      // Log sparingly: first 3 misses, and then every 5 misses
-      if (p1MissedHeartbeats <= 3 || (p1MissedHeartbeats % 5) == 0) {
-        logMessage("P1 heartbeat missed: %lus since last telegram (misses=%u, watchdog in %lus)",
-                  (unsigned)(since/1000),
-                  (unsigned)p1MissedHeartbeats,
-                  (unsigned)(remaining/1000));
-      }
-    } else {
-      // We received a telegram in the last second—reset counter
-      p1MissedHeartbeats = 0;
-    }
   }
 
   // ---- Watchdog: schedule a reboot if no P1 data for 60s ----
