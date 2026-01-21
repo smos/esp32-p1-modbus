@@ -386,24 +386,21 @@ void parseP1Line(const String& line) {
     if (lastP1DoneMs != 0) addSample(stP1, (uint32_t)(nowMs - lastP1DoneMs));
     lastP1DoneMs = nowMs;
 
-    bool seenPower[3][2] = { {false, false}, {false, false}, {false, false} }; // [Phase][Import/Export]
-    bool seenVoltage[3] = {false, false, false};
-
     while (true) {
       int end = telegramBuffer.indexOf('\n', pos);
       if (end < 0) break;
       String obisLine = telegramBuffer.substring(pos, end);
       pos = end + 1;
 
-      if      (obisLine.startsWith("1-0:32.7.0")) { phases[0].voltage = extractObisValue(obisLine); seenVoltage[0] = true; }
-      else if (obisLine.startsWith("1-0:52.7.0")) { phases[1].voltage = extractObisValue(obisLine); seenVoltage[1] = true; }
-      else if (obisLine.startsWith("1-0:72.7.0")) { phases[2].voltage = extractObisValue(obisLine); seenVoltage[2] = true; }
-      else if (obisLine.startsWith("1-0:21.7.0")) { L1_Import_W = extractObisValue(obisLine) * 1000.0f; seenPower[0][0]; }
-      else if (obisLine.startsWith("1-0:22.7.0")) { L1_Export_W = extractObisValue(obisLine) * 1000.0f; seenPower[1][1]; }
-      else if (obisLine.startsWith("1-0:41.7.0")) { L2_Import_W = extractObisValue(obisLine) * 1000.0f; seenPower[2][0]; }
-      else if (obisLine.startsWith("1-0:42.7.0")) { L2_Export_W = extractObisValue(obisLine) * 1000.0f; seenPower[0][1]; }
-      else if (obisLine.startsWith("1-0:61.7.0")) { L3_Import_W = extractObisValue(obisLine) * 1000.0f; seenPower[1][0]; }
-      else if (obisLine.startsWith("1-0:62.7.0")) { L3_Export_W = extractObisValue(obisLine) * 1000.0f; seenPower[2][1]; }
+      if      (obisLine.startsWith("1-0:32.7.0")) { phases[0].voltage = extractObisValue(obisLine); }
+      else if (obisLine.startsWith("1-0:52.7.0")) { phases[1].voltage = extractObisValue(obisLine);  }
+      else if (obisLine.startsWith("1-0:72.7.0")) { phases[2].voltage = extractObisValue(obisLine);  }
+      else if (obisLine.startsWith("1-0:21.7.0")) { L1_Import_W = extractObisValue(obisLine) * 1000.0f; }
+      else if (obisLine.startsWith("1-0:22.7.0")) { L1_Export_W = extractObisValue(obisLine) * 1000.0f; }
+      else if (obisLine.startsWith("1-0:41.7.0")) { L2_Import_W = extractObisValue(obisLine) * 1000.0f; }
+      else if (obisLine.startsWith("1-0:42.7.0")) { L2_Export_W = extractObisValue(obisLine) * 1000.0f; }
+      else if (obisLine.startsWith("1-0:61.7.0")) { L3_Import_W = extractObisValue(obisLine) * 1000.0f; }
+      else if (obisLine.startsWith("1-0:62.7.0")) { L3_Export_W = extractObisValue(obisLine) * 1000.0f; }
       else if (obisLine.startsWith("1-0:1.7.0")) totalDeliveredW = extractObisValue(obisLine) * 1000.0f; 
       else if (obisLine.startsWith("1-0:2.7.0")) totalReceivedW  = extractObisValue(obisLine) * 1000.0f; 
       else if (obisLine.startsWith("1-0:1.8.1")) energyImportT1 = extractObisValue(obisLine);
@@ -418,15 +415,6 @@ void parseP1Line(const String& line) {
     phases[1].power = L2_Import_W - L2_Export_W;
     phases[2].power = L3_Import_W - L3_Export_W;
 
-    // 3. Log missing data
-    for (int i = 0; i < 3; i++) {
-        if (!seenPower[i][0] && !seenPower[i][1]) {
-            logMessage("WARNING: Phase L%d power OBIS codes missing from telegram!", i+1);
-        }
-        if (!seenVoltage[i]) {
-            logMessage("WARNING: Phase L%d voltage OBIS code missing!", i+1);
-        }
-    }
 
     for (int i = 0; i < 3; i++) {
         if (abs(phases[i].voltage) > 1.0f) {
