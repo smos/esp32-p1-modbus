@@ -1195,6 +1195,55 @@ void setupWebServer() {
       request->send(resp);
     });
 
+    // Add HomeWizard compatible endpoints
+    server.on("/api/measurement", HTTP_GET, [](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        
+        // Create the JSON manually to avoid large ArduinoJson memory overhead
+        response->print("{");
+        response->print("\"protocol_version\":50,");
+        response->print("\"meter_model\":\"ESP32-P1-Emulated\",");
+        response->printf("\"unique_id\":\"%012llX\",", ESP.getEfuseMac());
+        
+        // Timestamp (ISO8601-ish)
+        if (timeClient.isTimeSet()) {
+            time_t rawTime = timeClient.getEpochTime();
+            struct tm* ti = localtime(&rawTime);
+            response->printf("\"timestamp\":\"%04d-%02d-%02dT%02d:%02d:%02d\",", 
+                            ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, 
+                            ti->tm_hour, ti->tm_min, ti->tm_sec);
+        }
+
+        // Totals
+        response->printf("\"energy_import_kwh\":%.3f,", energyImport);
+        response->printf("\"energy_import_t1_kwh\":%.3f,", energyImportT1);
+        response->printf("\"energy_import_t2_kwh\":%.3f,", energyImportT2);
+        response->printf("\"energy_export_kwh\":%.3f,", energyExport);
+        response->printf("\"energy_export_t1_kwh\":%.3f,", energyExportT1);
+        response->printf("\"energy_export_t2_kwh\":%.3f,", energyExportT2);
+        
+        // Instantaneous Power
+        response->printf("\"power_w\":%.0f,", netTotalPowerW);
+        response->printf("\"power_l1_w\":%.0f,", phases[0].power);
+        response->printf("\"power_l2_w\":%.0f,", phases[1].power);
+        response->printf("\"power_l3_w\":%.0f,", phases[2].power);
+        
+        // Currents and Voltages
+        response->printf("\"current_l1_a\":%.1f,", phases[0].current);
+        response->printf("\"current_l2_a\":%.1f,", phases[1].current);
+        response->printf("\"current_l3_a\":%.1f,", phases[2].current);
+        response->printf("\"voltage_l1_v\":%.1f,", phases[0].voltage);
+        response->printf("\"voltage_l2_v\":%.1f,", phases[1].voltage);
+        response->printf("\"voltage_l3_v\":%.1f",  phases[2].voltage);
+        
+        response->print("}");
+        request->send(response);
+    });
+
+    // Alias to /api/v1/data as many HomeWizard integrations look there first
+    server.on("/api/v1/data", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->redirect("/api/measurement");
+    });
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
         String html;
         html += R"HTML(
