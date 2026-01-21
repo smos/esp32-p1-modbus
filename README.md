@@ -12,6 +12,7 @@ Output available via
 - Runtime statistics with median update interval
 - Pushes current readings to SmartEVSE REST API endpoint
 - Watchdog reboots when no P1 data for 60s
+- HomeWizard HWE-P1 API v2 /api/measurement endpoint
 
 Possible to update firmware via WebUI on config page
 
