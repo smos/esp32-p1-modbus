@@ -10,7 +10,8 @@
 #include <map>
 #include <list> 
 #include <NTPClient.h>
-#include <WiFiUdp.h>        
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
 
 #include <esp_freertos_hooks.h>   // idle hooks for CPU load  (ESP-IDF)
 #include <esp_timer.h>            // µs timers
@@ -1196,7 +1197,7 @@ void setupWebServer() {
     });
 
     // Add HomeWizard compatible endpoints
-    server.on("/api/measurement", HTTP_GET, [](AsyncWebServerRequest *request) {
+    server.on("/api/v1/data", HTTP_GET, [](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         
         // Create the JSON manually to avoid large ArduinoJson memory overhead
@@ -1215,35 +1216,31 @@ void setupWebServer() {
         }
 
         // Totals
-        response->printf("\"energy_import_kwh\":%.3f,", energyImport);
-        response->printf("\"energy_import_t1_kwh\":%.3f,", energyImportT1);
-        response->printf("\"energy_import_t2_kwh\":%.3f,", energyImportT2);
-        response->printf("\"energy_export_kwh\":%.3f,", energyExport);
-        response->printf("\"energy_export_t1_kwh\":%.3f,", energyExportT1);
-        response->printf("\"energy_export_t2_kwh\":%.3f,", energyExportT2);
+        response->printf("\"total_import_kwh\":%.3f,", energyImport);
+        response->printf("\"total_import_t1_kwh\":%.3f,", energyImportT1);
+        response->printf("\"total_import_t2_kwh\":%.3f,", energyImportT2);
+        response->printf("\"total_export_kwh\":%.3f,", energyExport);
+        response->printf("\"total_export_t1_kwh\":%.3f,", energyExportT1);
+        response->printf("\"total_export_t2_kwh\":%.3f,", energyExportT2);
         
         // Instantaneous Power
-        response->printf("\"power_w\":%.0f,", netTotalPowerW);
-        response->printf("\"power_l1_w\":%.0f,", phases[0].power);
-        response->printf("\"power_l2_w\":%.0f,", phases[1].power);
-        response->printf("\"power_l3_w\":%.0f,", phases[2].power);
+        response->printf("\"active_power_w\":%.0f,", netTotalPowerW);
+        response->printf("\"active_power_l1_w\":%.0f,", phases[0].power);
+        response->printf("\"active_power_l2_w\":%.0f,", phases[1].power);
+        response->printf("\"active_power_l3_w\":%.0f,", phases[2].power);
         
         // Currents and Voltages
-        response->printf("\"current_l1_a\":%.1f,", phases[0].current);
-        response->printf("\"current_l2_a\":%.1f,", phases[1].current);
-        response->printf("\"current_l3_a\":%.1f,", phases[2].current);
-        response->printf("\"voltage_l1_v\":%.1f,", phases[0].voltage);
-        response->printf("\"voltage_l2_v\":%.1f,", phases[1].voltage);
-        response->printf("\"voltage_l3_v\":%.1f",  phases[2].voltage);
+        response->printf("\"active_current_l1_a\":%.1f,", phases[0].current);
+        response->printf("\"active_current_l2_a\":%.1f,", phases[1].current);
+        response->printf("\"active_current_l3_a\":%.1f,", phases[2].current);
+        response->printf("\"active_voltage_l1_v\":%.1f,", phases[0].voltage);
+        response->printf("\"active_voltage_l2_v\":%.1f,", phases[1].voltage);
+        response->printf("\"active_voltage_l3_v\":%.1f",  phases[2].voltage);
         
         response->print("}");
         request->send(response);
     });
 
-    // Alias to /api/v1/data as many HomeWizard integrations look there first
-    server.on("/api/v1/data", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->redirect("/api/measurement");
-    });
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
         String html;
         html += R"HTML(
@@ -1621,6 +1618,7 @@ void setup() {
   WiFiManager wm;
   wm.autoConnect("P1-Bridge-Setup");
   logMessage("WiFi Connected. IP: %s", WiFi.localIP().toString().c_str());
+
   ntpUDP.begin(2390); timeClient.begin();
   setupWebServer(); setupPassthroughServer(); 
   MBserver.registerWorker(modbusAddress, READ_HOLD_REGISTER, &readModbusRegisters); 
@@ -1628,6 +1626,26 @@ void setup() {
   MBserver.start(502, modbusAddress, 20000);
   mqtt.setServer(mqttHost.c_str(), 1883);
   lastP1TelegramTime = millis();
+
+  // Setup mDNS for P1 Meter
+  uint64_t chipmac = ESP.getEfuseMac();
+  char instanceName[32];
+  snprintf(instanceName, sizeof(instanceName), "p1meter-%012llX", chipmac);
+
+  // 2. Initialize mDNS
+  if (MDNS.begin(instanceName)) {
+      logMessage("mDNS responder started: %s", instanceName);
+      
+      // 3. Add the HomeWizard service: _hwenergy._tcp on port 80
+      MDNS.addService("hwenergy", "tcp", 80);
+      
+      // 4. Add required TXT records for HomeWizard API discovery
+      MDNS.addServiceTxt("hwenergy", "tcp", "path", "/api/v1/data");
+      MDNS.addServiceTxt("hwenergy", "tcp", "product_name", "P1 Meter");
+      MDNS.addServiceTxt("hwenergy", "tcp", "product_type", "HWE-P1");
+  } else {
+      logMessage("Error setting up mDNS responder!");
+  }
 
   // CPU load: register per-core idle hooks (must not block)
   esp_register_freertos_idle_hook_for_cpu(idleHookCore0, 0);
