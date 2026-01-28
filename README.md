@@ -24,16 +24,16 @@ By also providing a TCP server interface for the datagrams, integration with Hom
 Added a printable lipstick enclosure for the Waveshare esp32-s3-eth-poe board, as long as the pins are not soldered. See the enclosure directory for a Openscad drawing and STL files.
 
 Initial flashing with the Espressif upload tool.
-https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/flasher.png
+![alt text](https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/flasher.png)
 
 Some runtime statistics displayed for mean process/push latency
-https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/.png
+![alt text](https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/runtime.png)
 
 Live data displayed on the Status tab
-https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/livedata.png
+![alt text](https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/livedata.png)
 
 Config for general settings, default pin 1234.
-https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/config.png
+![alt text](https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/config.png)
 
 SmartEVSE config option for pushing data straight from P1 bridge to the EVSE without extra steps.
-https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/smartevse.png
+![alt text](https://github.com/smos/esp32-p1-modbus/blob/main/screenshots/smartevse.png)
